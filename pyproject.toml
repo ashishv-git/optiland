@@ -4,7 +4,6 @@ build-backend = "hatchling.build"
 
 [project]
 name = "optiland"
-version = "0.6.1"
 authors = [{ name = "Kramer Harrison", email = "kdanielharrison@gmail.com" }]
 description = "Open Source Optical Design in Python"
 readme = "README.md"
@@ -27,6 +26,7 @@ dependencies = [
     "typing-extensions>=4.1.0",
 ]
 license = { text = "MIT License" }
+dynamic = ["version"]
 
 [project.optional-dependencies]
 prescription-console = ["rich>=13.0"]
