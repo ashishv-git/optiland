@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "versioningit"]
 build-backend = "hatchling.build"
 
 [project]
@@ -60,6 +60,10 @@ packages = ["optiland", "optiland_gui"]
 
 [tool.hatch.metadata.files]
 "optiland/database" = ["*.csv", "*.yml", "**/*.yml", "*.npy"]
+
+[tool.hatch.version]
+source = "versioningit"
+default-version = "0.0.0+unknown"
 
 [tool.ruff]
 line-length = 88
