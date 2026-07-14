@@ -1,10 +1,9 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "versioningit"]
 build-backend = "hatchling.build"
 
 [project]
 name = "optiland"
-version = "0.6.1"
 authors = [{ name = "Kramer Harrison", email = "kdanielharrison@gmail.com" }]
 description = "Open Source Optical Design in Python"
 readme = "README.md"
@@ -27,6 +26,7 @@ dependencies = [
     "typing-extensions>=4.1.0",
 ]
 license = { text = "MIT License" }
+dynamic = ["version"]
 
 [project.optional-dependencies]
 prescription-console = ["rich>=13.0"]
@@ -60,6 +60,10 @@ packages = ["optiland", "optiland_gui"]
 
 [tool.hatch.metadata.files]
 "optiland/database" = ["*.csv", "*.yml", "**/*.yml", "*.npy"]
+
+[tool.hatch.version]
+source = "versioningit"
+default-version = "0.0.0+unknown"
 
 [tool.ruff]
 line-length = 88
