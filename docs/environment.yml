@@ -10,9 +10,8 @@ dependencies:
   - scipy
   - seaborn
   - tabulate
-  - vtk
   - xeus-python
   - pip:
     - ./jupyterlite/mock_libraries/numba
-    # - ./jupyterlite/mock_libraries/vtk
+    - ./jupyterlite/mock_libraries/vtk
     - ..
