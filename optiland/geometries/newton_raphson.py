@@ -55,10 +55,19 @@ class NewtonRaphsonGeometry(StandardGeometry, ABC):
 
     """
 
-    def __init__(self, coordinate_system, radius, conic=0.0, tol=1e-10, max_iter=100):
+    def __init__(
+        self,
+        coordinate_system,
+        radius,
+        conic=0.0,
+        tol=1e-10,
+        max_iter=100,
+        use_implicit_diff=True,
+    ):
         super().__init__(coordinate_system, radius, conic)
         self.tol = tol
         self.max_iter = max_iter
+        self.use_implicit_diff = use_implicit_diff
 
     def __str__(self):
         return "Newton Raphson"  # pragma: no cover
@@ -116,24 +125,8 @@ class NewtonRaphsonGeometry(StandardGeometry, ABC):
         """
         return self._surface_normal(rays.x, rays.y)
 
-    def distance(self, rays):
-        """
-        Calculates the distance from the ray origin to the surface intersection
-        using a robust Newton-Raphson method. This version uses the base conic
-        intersection as a strong initial guess.
-
-        Args:
-            rays (RealRays): The rays used for calculating distance.
-
-        Returns:
-            be.ndarray: An array of propagation distances 't' from each ray's
-            current position to its intersection point with the geometry.
-        """
-        # better initial guess for the propagation distance 't' by
-        # intersecting with the base conic surface.
-        t = super().distance(rays)
-
-        # Newton-Raphson method to refine the intersection point
+    def _newton_raphson_loop(self, rays, t):
+        """Helper method to execute the iterative Newton-Raphson loop."""
         for _ in range(self.max_iter):
             # current intersection point P(t) = P0 + t*D
             x_int = rays.x + t * rays.L
@@ -164,6 +157,68 @@ class NewtonRaphsonGeometry(StandardGeometry, ABC):
             # update step: t_new = t - f(t) / f'(t).
             safe_df_dt = be.where(be.abs(df_dt) > 1e-14, df_dt, 1e-14)
             t = t - f_t / safe_df_dt
+
+        return t
+
+    def distance(self, rays):
+        """
+        Calculates the distance from the ray origin to the surface intersection
+        using a robust Newton-Raphson method. This version uses the base conic
+        intersection as a strong initial guess.
+
+        Args:
+            rays (RealRays): The rays used for calculating distance.
+
+        Returns:
+            be.ndarray: An array of propagation distances 't' from each ray's
+            current position to its intersection point with the geometry.
+        """
+        # better initial guess for the propagation distance 't' by
+        # intersecting with the base conic surface.
+        t = super().distance(rays)
+
+        # Check if we should use implicit differentiation:
+        # - use_implicit_diff flag is enabled (can be toggled for fallback)
+        # - Backend is PyTorch (NumPy has no computational graph)
+        # - Gradient tracking is active (be.supports_gradients is a @property,
+        #   not a method)
+        if (
+            self.use_implicit_diff
+            and be.get_backend() == "torch"
+            and be.supports_gradients
+        ):
+            import torch
+
+            with torch.no_grad():
+                t = self._newton_raphson_loop(rays, t)
+
+            # [IMPLICIT DIFFERENTIATION]
+            # Perform one final mathematically exact Newton step with gradients enabled.
+            # This bridges the derivative of the surface into PyTorch's Autograd
+            # without unrolling the entire loop inside the computational graph.
+            x_int = rays.x + t * rays.L
+            y_int = rays.y + t * rays.M
+            z_int = rays.z + t * rays.N
+
+            # f_t must have gradients enabled to flow back to parameters!
+            f_t = self.sag(x_int, y_int) - z_int
+
+            # The denominator (surface normal) DOES NOT need gradients!
+            # Because f(t*) = 0 at the root, the derivative of f'(t) is multiplied by 0.
+            # We can completely skip building the massive second-derivative graph!
+            with torch.no_grad():
+                nx, ny, nz = self._surface_normal(x_int, y_int)
+                nz_safe = be.where(be.abs(nz) > 1e-14, nz, 1e-14)
+                fx = -nx / nz_safe
+                fy = -ny / nz_safe
+
+                df_dt = fx * rays.L + fy * rays.M - rays.N
+                safe_df_dt = be.where(be.abs(df_dt) > 1e-14, df_dt, 1e-14)
+
+            t = t - f_t / safe_df_dt
+        else:
+            # Fallback to standard PyTorch graph unrolling (or Numpy behavior)
+            t = self._newton_raphson_loop(rays, t)
 
         return t
 
@@ -264,7 +319,13 @@ class NewtonRaphsonGeometry(StandardGeometry, ABC):
 
         """
         geometry_dict = super().to_dict()
-        geometry_dict.update({"tol": self.tol, "max_iter": self.max_iter})
+        geometry_dict.update(
+            {
+                "tol": self.tol,
+                "max_iter": self.max_iter,
+                "use_implicit_diff": self.use_implicit_diff,
+            }
+        )
         return geometry_dict
 
     @classmethod
@@ -288,5 +349,6 @@ class NewtonRaphsonGeometry(StandardGeometry, ABC):
         conic = data.get("conic", 0.0)
         tol = data.get("tol", 1e-10)
         max_iter = data.get("max_iter", 100)
+        use_implicit_diff = data.get("use_implicit_diff", True)
 
-        return cls(cs, data["radius"], conic, tol, max_iter)
+        return cls(cs, data["radius"], conic, tol, max_iter, use_implicit_diff)
