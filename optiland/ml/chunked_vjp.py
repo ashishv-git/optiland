@@ -58,6 +58,21 @@ class _ChunkedVJPFunction(_AutogradFunction):
 
     Kept private: the supported entry point is :func:`chunked_vjp`, which
     validates its arguments before reaching autograd.
+
+    dO section II-D splits the computation into three stages, and it is worth
+    being clear which of them live here:
+
+    1. Accumulate the total with no graph. :meth:`forward`.
+    2. Forward and backward through the metric -- a loss, a neural network.
+       **Not here.** This is the caller's own ``loss.backward()``; autograd
+       reaches this Function only once it is done, and hands the result to
+       :meth:`backward` as ``grad_output``.
+    3. Backward through the system that produced each chunk.
+       :meth:`backward`.
+
+    Stage 2 is what makes the memory saving possible: because the metric has
+    already been reduced to a gradient at the total, stage 3 can replay the
+    chunks one at a time instead of keeping them all alive.
     """
 
     @staticmethod
@@ -87,6 +102,10 @@ class _ChunkedVJPFunction(_AutogradFunction):
         ctx.batch_fn = batch_fn
         ctx.setup_fn = setup_fn
         ctx.batches = batches
+        # Tensors go through save_for_backward rather than onto ctx directly:
+        # it is what lets autograd track their versions and catch a param
+        # mutated between the two passes, which would otherwise produce
+        # gradients evaluated at the wrong point.
         ctx.save_for_backward(*params)
 
         return total
@@ -117,6 +136,11 @@ class _ChunkedVJPFunction(_AutogradFunction):
         # returning a confident-looking zero.
         connected = [False] * len(params)
 
+        # enable_grad() is required, not defensive: @once_differentiable runs
+        # this method inside no_grad, so without it batch_fn would build no
+        # graph and autograd.grad would fail with "element 0 of tensors does
+        # not require grad". Removing it does not merely slow things down --
+        # it breaks the gradient.
         with torch.enable_grad():
             for batch in ctx.batches:
                 if ctx.setup_fn is not None:
@@ -237,6 +261,9 @@ def chunked_vjp(
             "call optiland.backend.set_backend('torch') first."
         )
 
+    # Copied into a list because both passes iterate it. A generator would be
+    # exhausted by the forward pass and yield nothing in the backward one,
+    # silently producing zero gradients rather than an error.
     batches = list(batches)
     if not batches:
         raise ValueError("batches is empty; nothing to reduce over.")
@@ -244,5 +271,13 @@ def chunked_vjp(
     params = tuple(params)
     if not params:
         raise ValueError("params is empty; there is nothing to accumulate.")
+
+    no_grad = [i for i, p in enumerate(params) if not p.requires_grad]
+    if no_grad:
+        raise ValueError(
+            f"params at position(s) {no_grad} do not require grad, so no "
+            "gradient can be accumulated for them. Call requires_grad_(True) "
+            "on them, or leave them out of params."
+        )
 
     return _ChunkedVJPFunction.apply(batch_fn, setup_fn, batches, *params)
