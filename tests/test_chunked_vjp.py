@@ -5,10 +5,10 @@ Scientific purpose:
 - verify the result does not depend on how the rays were chunked,
 - while the autograd graph stays O(1) in the number of chunks.
 
-The first two are the correctness claim: chunking is a memory strategy, not a
-numerical approximation, so it must change nothing about the answer. The third
-is the reason to do it at all, and is asserted directly on graph node counts
-rather than on process memory, which is too noisy to regress against.
+The first two establish correctness: chunking is a memory strategy, not a
+numerical approximation, so the result must be unchanged. The third establishes
+the benefit, and is asserted on graph node counts; process memory is too
+noisy to regress against.
 
 Equivalence is checked against a reference that never chunks, so a bug in the
 chunking logic cannot hide by being present on both sides.
@@ -35,9 +35,9 @@ def _torch_backend_float64_cpu():
 # --------------------------------------------------------------------------
 # A reduction with no optics in it.
 #
-# This deliberately involves no rays, no surfaces and no image: the primitive
-# is not a renderer, and the clearest way to say so is a test that exercises
-# it without an optical system present.
+# This involves no rays, no surfaces and no image. The primitive is not a
+# renderer, and exercising it without an optical system present demonstrates
+# that directly.
 # --------------------------------------------------------------------------
 
 N_SAMPLES = 60
@@ -67,7 +67,7 @@ def _chunks(total, size):
 
 
 def test_gradient_matches_non_chunked_autograd():
-    """The whole claim: chunking changes the memory profile, not the answer."""
+    """Chunking changes the memory profile, not the result."""
     samples = _make_samples()
 
     theta_ref = torch.tensor([0.7] * OUTPUT_SIZE, dtype=torch.float64,
@@ -92,11 +92,11 @@ def test_gradient_matches_non_chunked_autograd():
 
 @pytest.mark.parametrize("chunk_size", [1, 7, 8, N_SAMPLES, N_SAMPLES + 5])
 def test_result_is_invariant_to_chunk_size(chunk_size):
-    """Chunk size is a memory knob, so it must not be visible in the answer.
+    """Chunk size controls memory use only, and must not affect the result.
 
     Includes sizes that do not divide the total evenly, a size equal to the
-    total (one chunk) and a size larger than it (a short final chunk), since
-    those are where off-by-one partitioning bugs surface.
+    total (one chunk) and a size larger than it (a short final chunk), which
+    are the cases where off-by-one partitioning errors appear.
     """
     samples = _make_samples()
 
@@ -125,9 +125,8 @@ _GRAPH_CHUNK_SIZES = (30, 10, 2)
 def _accumulate_naively(samples, theta, chunk_size):
     """Chunk the reduction the way a user would without this primitive.
 
-    Every chunk's graph is kept alive until backward, because ``total``
-    references all of them. This is the baseline the primitive exists to
-    beat.
+    Every chunk's graph is retained until backward, because ``total``
+    references all of them. This is the baseline for comparison.
     """
     total = None
     for sl in _chunks(N_SAMPLES, chunk_size):
@@ -137,10 +136,10 @@ def _accumulate_naively(samples, theta, chunk_size):
 
 
 def test_naive_accumulation_graph_grows_with_chunk_count():
-    """Establish that the baseline really does grow.
+    """Confirm that the baseline does grow with chunk count.
 
     Without this, the flatness asserted below could be satisfied by a
-    primitive that silently built no useful graph at all.
+    primitive that built no useful graph.
     """
     samples = _make_samples()
     theta = torch.tensor([0.7] * OUTPUT_SIZE, dtype=torch.float64,
@@ -160,12 +159,12 @@ def test_naive_accumulation_graph_grows_with_chunk_count():
 
 
 def test_chunked_graph_size_is_flat_vs_chunk_count():
-    """The point of the exercise: more chunks must not mean a bigger graph.
+    """Graph size must not grow with the number of chunks.
 
-    Asserted on autograd node counts rather than process memory, which is far
-    too noisy to regress against. The forward pass runs under ``no_grad``, so
+    Asserted on autograd node counts; process memory is far too noisy to
+    regress against. The forward pass runs under ``no_grad``, so
     the returned tensor carries only what this primitive contributes,
-    whatever the chunk count.
+    regardless of chunk count.
     """
     samples = _make_samples()
     theta = torch.tensor([0.7] * OUTPUT_SIZE, dtype=torch.float64,
@@ -227,10 +226,9 @@ def _make_singlet():
 class _FixedDistribution:
     """A pupil sample set that can be sliced.
 
-    Chunking has to partition one fixed set of samples. Re-drawing random
-    samples per chunk would make the result depend on the chunk size, which
-    is precisely the failure mode ``test_result_is_invariant_to_chunk_size``
-    exists to catch.
+    Chunking must partition one fixed set of samples. Re-drawing random
+    samples per chunk would make the result depend on the chunk size, the
+    failure mode ``test_result_is_invariant_to_chunk_size`` detects.
     """
 
     def __init__(self, x, y):
@@ -255,7 +253,7 @@ def _pupil_samples(num_points):
 def _trace_and_reduce(lens, distribution):
     """Sum ray coordinates at the image plane.
 
-    Additive over rays and, unlike an image render, free of any binning that
+    Additive over rays and, unlike an image render, free of binning that
     could mask a gradient error behind a discretisation.
     """
     rays = lens.trace(
@@ -269,7 +267,7 @@ def _trace_and_reduce(lens, distribution):
 
 
 def test_gradient_matches_non_chunked_autograd_through_a_trace():
-    """Equivalence where it has to hold: through the real ray tracer."""
+    """Gradient equivalence through the real ray tracer."""
     be.grad_mode.enable()
     num_rays = 48
 

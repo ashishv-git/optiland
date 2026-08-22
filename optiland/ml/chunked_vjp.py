@@ -1,26 +1,65 @@
 """Chunked vector-Jacobian product accumulation.
 
-Reverse-mode autograd keeps the whole computational graph alive until the
-backward pass runs. For a reduction that sums over many rays -- rendering an
-image, accumulating irradiance on a detector -- that graph grows linearly with
-the ray count, and its peak size is what caps how many rays a differentiable
-design problem can afford.
+:func:`chunked_vjp` sums a function over batches and returns an ordinary
+autograd tensor. It differs from an equivalent hand-written loop in one
+respect: the graph it builds is sized by the largest batch, not by all of
+them together. ``.backward()`` and ``.grad`` behave as usual.
 
-:func:`chunked_vjp` lifts that cap for reductions that are *additive* over
-rays. The total is accumulated once under ``torch.no_grad()``, so the forward
-pass builds no graph at all. When the caller's ``loss.backward()`` reaches the
-result, each chunk is re-evaluated with gradients enabled, its vector-Jacobian
-product is taken against the incoming adjoint, and its graph is freed before
-the next chunk is built. Peak graph size is set by the largest chunk rather
-than by the total.
+The implementation is independent of what a batch contains and of any
+particular renderer. It applies to any reduction that sums over batches.
 
-This is the adjoint back-propagation of Wang et al., dO section II-D, lifted
-out of any particular renderer: nothing here knows what a ray or an image is.
+Why
+---
+Reverse-mode autograd retains the whole graph until the backward pass runs.
+For a reduction over rays -- rendering an image, accumulating irradiance on a
+detector -- the graph grows linearly with the ray count, and its peak
+determines the largest number of rays a differentiable design problem can
+trace.
 
-It composes with, rather than replaces, the implicit differentiation used by
-the Newton-Raphson solvers (see the Implicit Differentiation developer guide).
-Implicit differentiation bounds how *deep* the graph is per ray; this bounds
-how *wide* it is across rays.
+Chunking that loop directly does not reduce the peak. Every chunk's graph
+remains reachable from the running total, so all of them are still retained
+when the backward pass runs.
+
+How
+---
+Splitting the backward pass removes that constraint, following dO section
+II-D:
+
+1. Accumulate the total under ``torch.no_grad()``, so no graph is built.
+2. The caller's own ``loss.backward()`` reduces the metric -- a loss, a
+   neural network -- to a single gradient at the total.
+3. Re-evaluate one batch at a time with gradients enabled, take its
+   vector-Jacobian product against that gradient, add it to the running
+   total, and free the batch's graph before building the next.
+
+Stage 2 is a precondition for stage 3: once the metric has been reduced to a
+gradient at the total, each batch can be evaluated independently.
+
+When it applies
+---------------
+The reduction must be genuinely **additive** over batches, since stage 3
+supplies every batch with the same incoming gradient. This holds when the
+total is a plain sum of the batches. It does not hold for ``max``, or for a
+quantity normalised by something spanning all rays at once, such as a centroid
+reference.
+
+``batch_fn`` must also be **deterministic**, because stage 3 re-evaluates it
+and the result must reproduce stage 1 exactly.
+
+Neither condition is checked at runtime.
+
+Relation to implicit differentiation
+------------------------------------
+This composes with the implicit differentiation used by the Newton-Raphson
+solvers (see the Implicit Differentiation developer guide); it does not
+replace it. That bounds how *deep* the graph is per ray; this bounds how
+*wide* it is across rays.
+
+Reference
+---------
+Wang, Chen and Heidrich, "dO: A Differentiable Engine for Deep Lens Design of
+Computational Imaging Systems", IEEE Transactions on Computational Imaging,
+2022, section II-D.
 
 Ashish Verma, 2026
 """
@@ -42,7 +81,7 @@ if TYPE_CHECKING:
 
 # Subclassing must not blow up at import time when torch is absent: this
 # module is imported unconditionally by ``optiland.ml``, and the numpy path
-# has to keep working. Mirrors the guard in optiland/ml/wrappers.py.
+# must keep working. Mirrors the guard in optiland/ml/wrappers.py.
 _AutogradFunction = torch.autograd.Function if torch is not None else object
 
 if torch is not None:
@@ -65,14 +104,14 @@ class _ChunkedVJPFunction(_AutogradFunction):
     1. Accumulate the total with no graph. :meth:`forward`.
     2. Forward and backward through the metric -- a loss, a neural network.
        **Not here.** This is the caller's own ``loss.backward()``; autograd
-       reaches this Function only once it is done, and hands the result to
-       :meth:`backward` as ``grad_output``.
+       reaches this Function only after it completes, and supplies the result
+       to :meth:`backward` as ``grad_output``.
     3. Backward through the system that produced each chunk.
        :meth:`backward`.
 
-    Stage 2 is what makes the memory saving possible: because the metric has
-    already been reduced to a gradient at the total, stage 3 can replay the
-    chunks one at a time instead of keeping them all alive.
+    Stage 2 is a precondition for stage 3: once the metric has been reduced to
+    a gradient at the total, each chunk can be evaluated in turn, with no
+    need to retain them all simultaneously.
     """
 
     @staticmethod
@@ -102,10 +141,10 @@ class _ChunkedVJPFunction(_AutogradFunction):
         ctx.batch_fn = batch_fn
         ctx.setup_fn = setup_fn
         ctx.batches = batches
-        # Tensors go through save_for_backward rather than onto ctx directly:
-        # it is what lets autograd track their versions and catch a param
-        # mutated between the two passes, which would otherwise produce
-        # gradients evaluated at the wrong point.
+        # Tensors go through save_for_backward, not onto ctx directly:
+        # this lets autograd track their versions and detect a param mutated
+        # between the two passes, which would otherwise produce gradients
+        # evaluated at the wrong point.
         ctx.save_for_backward(*params)
 
         return total
@@ -117,8 +156,8 @@ class _ChunkedVJPFunction(_AutogradFunction):
 
         ``grad_output`` is dL/d(total). Because the total is a plain sum of
         the chunks, d(total)/d(chunk_i) is 1, so the same ``grad_output``
-        is the correct incoming adjoint for every chunk -- which is what
-        makes chunking valid at all, and why the reduction has to be
+        is the correct incoming adjoint for every chunk. This is the basis on
+        which chunking is valid, and the reason the reduction must be
         additive.
 
         Args:
@@ -131,16 +170,15 @@ class _ChunkedVJPFunction(_AutogradFunction):
         """
         params = ctx.saved_tensors
         param_grads = [torch.zeros_like(p) for p in params]
-        # A param that never receives a VJP from any chunk is a silent-wrong-
-        # gradient hazard, so track connectivity and raise rather than
-        # returning a confident-looking zero.
+        # A param that never receives a VJP from any chunk would otherwise be
+        # reported as having a zero gradient, which is indistinguishable from a
+        # genuine zero. Track connectivity and raise instead.
         connected = [False] * len(params)
 
-        # enable_grad() is required, not defensive: @once_differentiable runs
-        # this method inside no_grad, so without it batch_fn would build no
-        # graph and autograd.grad would fail with "element 0 of tensors does
-        # not require grad". Removing it does not merely slow things down --
-        # it breaks the gradient.
+        # enable_grad() is required for correctness, not performance:
+        # @once_differentiable runs this method inside no_grad, so without it
+        # batch_fn builds no graph and autograd.grad fails with "element 0 of
+        # tensors does not require grad".
         with torch.enable_grad():
             for batch in ctx.batches:
                 if ctx.setup_fn is not None:
@@ -162,7 +200,7 @@ class _ChunkedVJPFunction(_AutogradFunction):
                     contribution,
                     params,
                     grad_outputs=grad_output,
-                    retain_graph=False,  # this chunk's graph dies here
+                    retain_graph=False,  # frees this chunk's graph
                     allow_unused=True,
                 )
 
@@ -178,11 +216,11 @@ class _ChunkedVJPFunction(_AutogradFunction):
                 "not connected to the graph built by batch_fn, so their "
                 "gradients would silently be zero. Check that batch_fn uses "
                 "these tensors, and that setup_fn re-injects them into the "
-                "system on every call rather than reading them out as plain "
+                "system on every call instead of reading them out as plain "
                 "values."
             )
 
-        # Break the reference cycle so the batches and closures can be freed.
+        # Clear the reference cycle so the batches and closures can be freed.
         ctx.batch_fn = None
         ctx.setup_fn = None
         ctx.batches = None
@@ -202,7 +240,7 @@ def chunked_vjp(
     The result is a normal autograd tensor: call ``.backward()`` on a loss
     derived from it and the gradients land on ``params`` as usual. What
     differs is that the graph for each chunk is built, used and freed one
-    chunk at a time, so peak memory tracks the largest chunk rather than the
+    chunk at a time, so peak memory tracks the largest chunk, not the
     total.
 
     Args:
@@ -210,12 +248,12 @@ def chunked_vjp(
             contribution to the total. Must return the **same shape** on
             every call -- a chunk is a subset of rays, not a subset of the
             output, so every chunk contributes to the whole output. Must be
-            deterministic: the backward pass re-runs it and the result has to
-            reproduce the forward pass exactly.
+            deterministic: the backward pass re-evaluates it and the result
+            must reproduce the forward pass exactly.
         batches: The batches to reduce over, for example index slices into a
             pre-generated set of pupil samples. Passing explicit slices,
-            rather than per-chunk random seeds, is what makes the result
-            invariant to chunk size.
+            keeps the result invariant to chunk size; per-chunk random seeds
+            would not.
         params: Tensors to accumulate gradients for. Each must be reachable
             from the graph ``batch_fn`` builds.
         setup_fn: Called before every batch in both passes, for systems that
@@ -263,7 +301,7 @@ def chunked_vjp(
 
     # Copied into a list because both passes iterate it. A generator would be
     # exhausted by the forward pass and yield nothing in the backward one,
-    # silently producing zero gradients rather than an error.
+    # silently producing zero gradients instead of an error.
     batches = list(batches)
     if not batches:
         raise ValueError("batches is empty; nothing to reduce over.")
