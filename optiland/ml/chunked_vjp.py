@@ -16,11 +16,13 @@ the tensor the reduction accumulates into. The merit function is any
 scalar-valued function of the total: for example a least-squares comparison
 against a target, or a neural network computing a perceptual loss.
 
-A *batch* is a subset of the rays. Its rays may contribute to any element of
-the total tensor, so a batch's contribution matches the shape of the whole
-total. For example, when the total is a rendered image, a batch's
-contribution is that whole image, dim and sparsely sampled. A tile of the
-image, fully illuminated, would be the wrong shape.
+A *batch* is a subset of the rays. The total is the plain sum of the batch
+contributions, so every contribution has the shape of the whole total. For
+example, when the total is a rendered image, a batch's contribution is that
+whole image, dim and sparsely sampled. A tile of the image, fully
+illuminated, would be the wrong shape. This holds even when a batch's rays
+reach only part of the total: the contribution is still the whole image, zero
+outside the region those rays cover.
 
 Placeholder beyond this point. The remaining sections are added as the code
 they describe is written.
@@ -43,16 +45,52 @@ if TYPE_CHECKING:
 # torch.autograd.Function when torch is installed, and plain ``object`` when
 # it is not.
 #
-# The fallback is needed because a class statement evaluates its base class
-# when the file is imported, so that name has to exist either way. optiland
-# supports a numpy-only install. Once ml/__init__.py exports chunked_vjp,
-# importing optiland.ml will run this file, so on a machine without torch the
-# class statement below would fail if this assignment had no fallback.
+# A class statement is executed when the file is imported, and executing it
+# evaluates the base class named in its parentheses. Importing this file
+# therefore runs ``class _ChunkedVJP(_AutogradFunction):`` below and looks up
+# ``_AutogradFunction`` at that moment, so the name has to resolve whether or
+# not torch is installed. optiland supports a numpy-only install, and once
+# ml/__init__.py imports chunked_vjp from here, importing optiland.ml runs
+# this file. Naming ``torch.autograd.Function`` directly in the class
+# statement would raise AttributeError on a numpy-only install.
 #
-# A class built on ``object`` has no apply() and cannot be used, but the
-# import succeeds and a numpy-only user is unaffected. wrappers.py guards
-# OpticalSystemModule the same way, so this is the established approach here.
+# With ``object`` as the base class, _ChunkedVJP has no apply() and cannot be
+# used, but the import succeeds and a numpy-only user is unaffected.
+# wrappers.py guards OpticalSystemModule the same way, so this is the
+# established approach here.
 _AutogradFunction = torch.autograd.Function if torch is not None else object
+
+
+def _check_contribution_shape(contribution, expected, expected_desc: str) -> None:
+    """Raise if one batch's contribution is not shaped like the total.
+
+    Called from both passes, which compare against different tensors: the
+    forward pass against the total the first batch established, the backward
+    pass against the incoming gradient. The message is the same either way, so
+    it lives here instead of being written out twice.
+
+    Both comparisons are against another value the same ``batch_fn`` produced,
+    so this establishes consistency and not correctness. A ``batch_fn``
+    returning the same wrong shape on every call is self-consistent and passes:
+    four equal tiles of an image sum to a tile-shaped total without error.
+
+    Args:
+        contribution (torch.Tensor): What ``batch_fn`` returned for one batch.
+        expected (torch.Tensor): The tensor whose shape it has to match.
+        expected_desc (str): Names ``expected`` in the error message.
+
+    Raises:
+        ValueError: If the two shapes differ.
+    """
+    if contribution.shape != expected.shape:
+        raise ValueError(
+            f"batch_fn must return the same shape on every call. It returned "
+            f"{tuple(contribution.shape)}, but {expected_desc} has shape "
+            f"{tuple(expected.shape)}. The total is the plain sum of the batch "
+            f"contributions, so every contribution has the shape of the whole "
+            f"total. Returning only the part of the total a batch's own rays "
+            f"reach is the usual cause."
+        )
 
 
 class _ChunkedVJP(_AutogradFunction):
@@ -63,28 +101,41 @@ class _ChunkedVJP(_AutogradFunction):
     """
 
     @staticmethod
-    def forward(ctx, batch_fn, setup_fn, batches, *params):
+    def forward(
+        ctx,
+        batch_fn: Callable[[Any], torch.Tensor],
+        setup_fn: Callable[[], None] | None,
+        batches: Sequence[Any],
+        *params: torch.Tensor,
+    ) -> torch.Tensor:
         """Accumulate the total over the batches without building a graph.
 
         Args:
-            ctx: Autograd context.
+            ctx: Autograd context. Anything :meth:`backward` needs is stored
+                on it here.
             batch_fn: Maps one batch to its contribution to the total.
-            setup_fn: Called before each batch, or None.
-            batches: The batches to reduce over.
+            setup_fn: A callable taking no arguments, run before every batch.
+                None when the caller supplied none.
+            batches: The subsets of rays to reduce over. Each is passed to
+                ``batch_fn`` unchanged.
             *params: The tensors to differentiate with respect to. Passed
                 positionally so that autograd records them as inputs to this
-                Function, which is what lets gradients flow back to them.
+                Function. Gradients flow back only to what it records.
 
         Returns:
             torch.Tensor: The total, the sum of every batch's contribution.
         """
+        # None until the first batch arrives. The total takes its shape and
+        # dtype from whatever batch_fn returns, neither of which is known
+        # before then, so there is nothing to preallocate.
         total = None
-        # Disables gradient recording for the accumulation. Autograd already
-        # runs forward() with gradients off when this Function is reached
-        # through apply(), so on that path the context manager changes
-        # nothing. It is kept for two reasons: stage 1 is a no-grad forward
-        # pass by definition, and calling forward() directly bypasses apply()
-        # and would otherwise build the very graph this module avoids.
+
+        # no_grad() disables gradient recording for the accumulation. Autograd
+        # already runs forward() with gradients off when this Function is reached
+        # through apply(), so on that path this changes nothing. It is kept
+        # for the case it does cover: calling forward() directly leaves
+        # gradients enabled, and the accumulation would then build the graph
+        # this method exists to avoid.
         with torch.no_grad():
             for batch in batches:
                 if setup_fn is not None:
@@ -92,16 +143,19 @@ class _ChunkedVJP(_AutogradFunction):
                 contribution = batch_fn(batch)
                 if total is None:
                     # Cloned because the following batches are added into it.
-                    # batch_fn may hand back a tensor the caller still holds,
-                    # and accumulating into that would change a value on their
-                    # side.
+                    # batch_fn may return a tensor the caller still references,
+                    # and accumulating into that would modify the caller's own
+                    # tensor in place.
                     total = contribution.clone()
                 else:
-                    # Added in place so that a batch returning a different
-                    # shape raises here. Out-of-place addition broadcasts
-                    # instead, turning a (3,) total plus a (3, 1) contribution
-                    # into a (3, 3) one with no error. Returning only the part
-                    # of the total a batch touches is the mistake this catches.
+                    # The first batch fixes the shape of the total. Checked
+                    # explicitly because the addition below would accept a
+                    # contribution that broadcasts into that shape, such as
+                    # (1, 4) into (3, 4).
+                    _check_contribution_shape(
+                        contribution, total, "the first batch's contribution"
+                    )
+                    # Added in place to reuse the buffer the clone allocated.
                     total += contribution
 
         # The backward pass replays every batch, so it needs these three
