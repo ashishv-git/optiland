@@ -148,27 +148,31 @@ class _ChunkedVJP(_AutogradFunction):
                     # tensor in place.
                     total = contribution.clone()
                 else:
-                    # The first batch fixes the shape of the total. Checked
-                    # explicitly because the addition below would accept a
-                    # contribution that broadcasts into that shape, such as
-                    # (1, 4) into (3, 4).
+                    # Checked explicitly because the addition below would
+                    # accept a contribution that broadcasts into the total's
+                    # shape, such as (1, 4) into (3, 4).
                     _check_contribution_shape(
                         contribution, total, "the first batch's contribution"
                     )
-                    # Added in place to reuse the buffer the clone allocated.
+                    # Added in place, so the whole reduction writes into the
+                    # tensor the clone allocated instead of allocating one
+                    # per batch.
                     total += contribution
 
-        # The backward pass replays every batch, so it needs these three
-        # again. None of them is a tensor, so they are assigned to ctx
-        # directly.
+        # backward re-evaluates batch_fn for every batch, so it needs batch_fn,
+        # setup_fn and batches again. None of them is a tensor, so they go on
+        # ctx as plain attributes.
         ctx.batch_fn = batch_fn
         ctx.setup_fn = setup_fn
         ctx.batches = batches
-        # The tensors go through save_for_backward, which records the version
-        # of each one. A param modified in place between the two passes then
-        # raises when backward reads it back. Assigning them to ctx would skip
-        # that check and differentiate at a point the forward pass never
-        # evaluated.
+        # The three above are plain ctx attributes; params are saved with
+        # save_for_backward instead, which records each tensor's version
+        # counter -- a number torch increments on every in-place modification.
+        # Reading them back as ctx.saved_tensors compares the counters and
+        # raises RuntimeError if any has changed: "one of the variables needed
+        # for gradient computation has been modified by an inplace operation".
+        # Plain attributes would skip that comparison, and backward would then
+        # compute gradients from parameter values the forward pass never used.
         ctx.save_for_backward(*params)
 
         return total
