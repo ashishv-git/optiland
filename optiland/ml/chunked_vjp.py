@@ -39,10 +39,19 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 
-# Subclassing happens when this module is imported, so the base class has to
-# exist even where torch does not. ``optiland.ml`` is imported unconditionally
-# and the numpy path has to keep working, hence the fallback to ``object``.
-# The same pattern is used in optiland/ml/wrappers.py.
+# Pick the base class that _ChunkedVJPFunction below will inherit from:
+# torch.autograd.Function when torch is installed, and plain ``object`` when
+# it is not.
+#
+# The fallback is needed because a class statement evaluates its base class
+# when the file is imported, so that name has to exist either way. optiland
+# supports a numpy-only install. Once ml/__init__.py exports chunked_vjp,
+# importing optiland.ml will run this file, so on a machine without torch the
+# class statement below would fail if this assignment had no fallback.
+#
+# A class built on ``object`` has no apply() and cannot be used, but the
+# import succeeds and a numpy-only user is unaffected. wrappers.py guards
+# OpticalSystemModule the same way, so this is the established approach here.
 _AutogradFunction = torch.autograd.Function if torch is not None else object
 
 
@@ -55,7 +64,7 @@ class _ChunkedVJPFunction(_AutogradFunction):
 
     @staticmethod
     def forward(ctx, batch_fn, setup_fn, batches, *params):
-        """Accumulate the total over batches.
+        """Accumulate the total over the batches without building a graph.
 
         Args:
             ctx: Autograd context.
@@ -67,9 +76,48 @@ class _ChunkedVJPFunction(_AutogradFunction):
                 Function, which is what lets gradients flow back to them.
 
         Returns:
-            torch.Tensor: The total.
+            torch.Tensor: The total, the sum of every batch's contribution.
         """
-        raise NotImplementedError
+        total = None
+        # Disables gradient recording for the accumulation. Autograd already
+        # runs forward() with gradients off when this Function is reached
+        # through apply(), so on that path the context manager changes
+        # nothing. It is kept for two reasons: stage 1 is a no-grad forward
+        # pass by definition, and calling forward() directly bypasses apply()
+        # and would otherwise build the very graph this module avoids.
+        with torch.no_grad():
+            for batch in batches:
+                if setup_fn is not None:
+                    setup_fn()
+                contribution = batch_fn(batch)
+                if total is None:
+                    # Cloned because the following batches are added into it.
+                    # batch_fn may hand back a tensor the caller still holds,
+                    # and accumulating into that would change a value on their
+                    # side.
+                    total = contribution.clone()
+                else:
+                    # Added in place so that a batch returning a different
+                    # shape raises here. Out-of-place addition broadcasts
+                    # instead, turning a (3,) total plus a (3, 1) contribution
+                    # into a (3, 3) one with no error. Returning only the part
+                    # of the total a batch touches is the mistake this catches.
+                    total += contribution
+
+        # The backward pass replays every batch, so it needs these three
+        # again. None of them is a tensor, so they are assigned to ctx
+        # directly.
+        ctx.batch_fn = batch_fn
+        ctx.setup_fn = setup_fn
+        ctx.batches = batches
+        # The tensors go through save_for_backward, which records the version
+        # of each one. A param modified in place between the two passes then
+        # raises when backward reads it back. Assigning them to ctx would skip
+        # that check and differentiate at a point the forward pass never
+        # evaluated.
+        ctx.save_for_backward(*params)
+
+        return total
 
     @staticmethod
     def backward(ctx, grad_output):
