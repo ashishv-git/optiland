@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 
-# Pick the base class that _ChunkedVJPFunction below will inherit from:
+# Pick the base class that _ChunkedVJP below will inherit from:
 # torch.autograd.Function when torch is installed, and plain ``object`` when
 # it is not.
 #
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 _AutogradFunction = torch.autograd.Function if torch is not None else object
 
 
-class _ChunkedVJPFunction(_AutogradFunction):
+class _ChunkedVJP(_AutogradFunction):
     """Autograd bridge for :func:`chunked_vjp`.
 
     Kept private: the supported entry point is :func:`chunked_vjp`, which
@@ -189,4 +189,4 @@ def chunked_vjp(
     # argument leaves the tensors unregistered, the returned total does not
     # require grad, and .backward() then fails with "element 0 of tensors does
     # not require grad".
-    return _ChunkedVJPFunction.apply(batch_fn, setup_fn, batches, *params)
+    return _ChunkedVJP.apply(batch_fn, setup_fn, batches, *params)
