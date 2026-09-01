@@ -60,6 +60,18 @@ if TYPE_CHECKING:
 # established approach here.
 _AutogradFunction = torch.autograd.Function if torch is not None else object
 
+# Pick the decorator that backward() below will carry. once_differentiable
+# makes a second differentiation raise instead of returning a wrong answer;
+# this module supports first-order gradients only. It needs the same fallback
+# as _AutogradFunction above, because a decorator is applied when the class
+# body runs, which happens as the file is imported.
+if torch is not None:
+    _once_differentiable = torch.autograd.function.once_differentiable
+else:  # pragma: no cover - only runs when torch is not installed
+
+    def _once_differentiable(fn):
+        return fn
+
 
 def _check_contribution_shape(contribution, expected, expected_desc: str) -> None:
     """Raise if one batch's contribution is not shaped like the total.
@@ -178,20 +190,103 @@ class _ChunkedVJP(_AutogradFunction):
         return total
 
     @staticmethod
-    def backward(ctx, grad_output):
+    @_once_differentiable
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
         """Re-evaluate each batch and accumulate its vector-Jacobian product.
 
+        The total is the plain sum of the batch contributions, so the
+        derivative of the total with respect to any one of them is 1, and
+        ``grad_output`` is the correct incoming gradient for every batch
+        unchanged. That is what makes chunking valid, and it is why the
+        reduction has to be additive.
+
         Args:
-            ctx: Autograd context.
-            grad_output (torch.Tensor): Gradient of the merit function with
-                respect to the total.
+            ctx: Autograd context, holding what :meth:`forward` stored.
+            grad_output: Gradient of the merit function with respect to the
+                total.
 
         Returns:
-            tuple: One gradient per argument ``forward`` received, in the same
-            order. The leading entries are ``None`` because ``batch_fn``,
-            ``setup_fn`` and ``batches`` are not differentiable.
+            tuple: One gradient per argument :meth:`forward` received, in the
+            same order. The three leading entries are ``None`` because
+            ``batch_fn``, ``setup_fn`` and ``batches`` are not tensors.
+
+        Raises:
+            ValueError: If ``batch_fn`` returns a shape other than the one the
+                forward pass accumulated.
+            RuntimeError: If any entry of ``params`` is unreachable from the
+                graph ``batch_fn`` builds.
         """
-        raise NotImplementedError
+        params = ctx.saved_tensors
+        param_grads = [torch.zeros_like(p) for p in params]
+        # A param no batch reaches would otherwise finish with a zero
+        # gradient, which the caller cannot tell from a genuine zero. Recorded
+        # per param so that case can raise once the loop ends.
+        connected = [False] * len(params)
+
+        # enable_grad() is required for correctness here, unlike the no_grad()
+        # in forward. once_differentiable runs this method with gradients
+        # disabled, so without it batch_fn records nothing and autograd.grad
+        # fails with "element 0 of tensors does not require grad and does not
+        # have a grad_fn".
+        with torch.enable_grad():
+            for batch in ctx.batches:
+                if ctx.setup_fn is not None:
+                    # Called inside enable_grad so that a system re-reading
+                    # params here connects them to the graph batch_fn builds.
+                    # Outside it, the re-injected values would be detached and
+                    # no gradient would reach params.
+                    ctx.setup_fn()
+
+                contribution = ctx.batch_fn(batch)
+                _check_contribution_shape(
+                    contribution, grad_output, "the total from the forward pass"
+                )
+
+                # autograd.grad returns the gradients; the engine applies
+                # whatever this method returns. contribution.backward() would
+                # apply them here as well, and every gradient would come out
+                # doubled with no error raised. Returning them is also what
+                # makes an explicit params list necessary: autograd.grad needs
+                # its inputs named, which .backward() would have inferred.
+                vjps = torch.autograd.grad(
+                    contribution,
+                    params,
+                    grad_outputs=grad_output,
+                    # This batch's graph is freed as its gradient is taken, so
+                    # only one exists at a time. It is the line that bounds
+                    # the memory.
+                    retain_graph=False,
+                    # Returns None for a param this batch did not reach,
+                    # instead of raising. Some batches legitimately miss a
+                    # param; a param that every batch misses is the error, and
+                    # connected[] below is what tells the two apart.
+                    allow_unused=True,
+                )
+
+                for i, vjp in enumerate(vjps):
+                    if vjp is not None:
+                        param_grads[i] += vjp
+                        connected[i] = True
+
+        unused = [i for i, ok in enumerate(connected) if not ok]
+        if unused:
+            raise RuntimeError(
+                f"No gradient reached params at position(s) {unused}. They are "
+                "not connected to the graph batch_fn builds, so their gradients "
+                "would silently be zero. Check that batch_fn uses these "
+                "tensors, and that setup_fn puts them back into the system on "
+                "every call instead of reading their values out once."
+            )
+
+        # ctx is reachable from the grad_fn of the total, which the caller may
+        # still hold, so batch_fn, setup_fn and batches would stay alive with
+        # it. batch_fn is typically a closure over the whole pre-generated ray
+        # set. Dropping the references frees them when this pass ends instead.
+        ctx.batch_fn = None
+        ctx.setup_fn = None
+        ctx.batches = None
+
+        return (None, None, None, *param_grads)
 
 
 def chunked_vjp(
