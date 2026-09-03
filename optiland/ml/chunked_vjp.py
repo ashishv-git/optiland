@@ -37,6 +37,8 @@ try:
 except ImportError:  # pragma: no cover - only runs when torch is not installed
     torch = None
 
+import optiland.backend as be
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
@@ -310,32 +312,69 @@ def chunked_vjp(
 
     Returns:
         torch.Tensor: The total, the sum of every batch's contribution.
+
+    Raises:
+        RuntimeError: If torch is not installed, if the active backend is not
+            torch, or if any entry of ``params`` is unreachable from the graph
+            ``batch_fn`` builds.
+        ValueError: If ``batches`` is empty; if ``params`` is empty, is a
+            single tensor, or holds a tensor that does not require grad; or if
+            ``batch_fn`` returns a different shape on different calls.
     """
     # TODO: docstring sections still to add, each alongside the code that
-    # makes it true -- a body paragraph on graph lifetime, Raises, Warning,
-    # Example, and the per-argument constraints (same shape on every call,
-    # batches re-usable, params requiring grad and reachable, setup_fn called
-    # in both passes and therefore needing to be idempotent). The finished
-    # version is on feat/chunked-vjp-reference if a reference is wanted.
-    #
-    # TODO: when the entry checks are written, reject a bare torch.Tensor
-    # passed as params. A tensor is itself a sequence, so params=radius
-    # instead of params=[radius] iterates it into row views. Every other
-    # guard lets that through: the views require grad, so the requires_grad
-    # check passes, and they are genuinely in the graph, so the connectivity
-    # check passes. Gradients are then computed against temporaries and
-    # discarded, leaving the caller's tensor with .grad still None and their
-    # optimiser doing nothing. Detect it with is_leaf, which is False for
-    # every element in that case.
-    #
-    # TODO: when backward() is written, put a comment beside the
-    # torch.autograd.grad call explaining why it is used instead of
-    # .backward(). A custom Function must return gradients for autograd to
-    # apply; calling .backward() there applies them as well, and the result
-    # is silently doubled. autograd.grad returns them, and it is what
-    # requires the explicit params list. Without the comment the next reader
-    # sees a longer form of something .backward() would do in one line.
-    #
+    # makes it true -- a body paragraph on graph lifetime, Warning, Example,
+    # and the per-argument constraints (same shape on every call, batches
+    # re-usable, params reachable, setup_fn called in both passes and
+    # therefore needing to be idempotent). The finished version is on
+    # feat/chunked-vjp-reference if a reference is wanted.
+    if torch is None:
+        raise RuntimeError(
+            "chunked_vjp requires the 'torch' package. Install PyTorch to use "
+            "this function."
+        )
+    if be.get_backend() != "torch":
+        raise RuntimeError(
+            "chunked_vjp requires the 'torch' backend, but the active backend "
+            f"is '{be.get_backend()}'. This feature accumulates gradients "
+            "through PyTorch autograd and has no numpy equivalent; call "
+            "optiland.backend.set_backend('torch') first."
+        )
+
+    # Copied into a list because both passes iterate it. A generator would be
+    # exhausted by the forward pass, leaving the backward pass nothing to
+    # re-evaluate, and the gradient would come back zero with no error.
+    batches = list(batches)
+    if not batches:
+        raise ValueError("batches is empty; there is nothing to reduce over.")
+
+    # Tested before params is converted, because converting it is what hides
+    # the mistake. A tensor is itself a sequence, so params=radius rather than
+    # params=[radius] iterates into row views, and every later check is
+    # satisfied: the views require grad, and they are genuinely in the graph
+    # batch_fn builds, so backward's connectivity check passes too. Gradients
+    # accumulate onto those temporaries and are discarded with them, leaving
+    # the caller's own tensor with .grad still None and their optimiser with
+    # nothing to step.
+    if isinstance(params, torch.Tensor):
+        raise ValueError(
+            "params must be a sequence of tensors, but a single tensor was "
+            "given. Iterating it differentiates with respect to its rows "
+            "instead of the tensor itself, and no gradient reaches the tensor "
+            "you passed. Write params=[tensor] instead of params=tensor."
+        )
+
+    params = tuple(params)
+    if not params:
+        raise ValueError("params is empty; there is nothing to accumulate.")
+
+    no_grad = [i for i, p in enumerate(params) if not p.requires_grad]
+    if no_grad:
+        raise ValueError(
+            f"params at position(s) {no_grad} do not require grad, so no "
+            "gradient can be accumulated for them. Call requires_grad_(True) "
+            "on them, or leave them out of params."
+        )
+
     # Each tensor is passed as its own argument to apply(). Autograd works out
     # what this Function depends on by looking at the arguments it receives,
     # and it does not look inside a list. Passing params as a single list
