@@ -464,10 +464,11 @@ def chunked_vjp(
             the total is the plain sum of the contributions.
         batches: The batches of rays to reduce over. A typical choice is to
             generate all the rays once, then pass slices into that array.
-            Each batch is used once per pass, so it has to survive being used
-            twice: an index slice or array works, a one-shot iterator does
-            not. Slices also keep the result invariant to batch size, which
-            per-batch random seeds would not.
+            Slices keep the ray set fixed, so the result does not change with
+            batch size. Each batch is used once in the forward pass and once
+            in the backward pass. If the forward pass consumes a batch, the
+            backward pass sees it empty and the gradient comes back zero,
+            with no error raised.
         params: The tensors to differentiate with respect to. Each must
             require grad and be reachable from the graph ``batch_fn`` builds.
             Pass a sequence, so ``params=[radius]`` and never
