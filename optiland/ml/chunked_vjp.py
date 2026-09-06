@@ -373,10 +373,11 @@ class _ChunkedVJP(_AutogradFunction):
                     # creating graph nodes between params and the Variable
                     # objects. After each batch, retain_graph=False frees those
                     # nodes. Without a fresh setup_fn call, the next batch
-                    # would trace through freed graph nodes, and gradients
-                    # would not reach params. The enable_grad() context is
-                    # required so that these re-established edges are tracked
-                    # by autograd; outside it, they would be detached.
+                    # traces through the freed nodes and autograd.grad raises
+                    # "Trying to backward through the graph a second time".
+                    # The enable_grad() context is required so that these
+                    # re-established edges are tracked by autograd; outside it,
+                    # they would be detached.
                     ctx.setup_fn()
 
                 contribution = ctx.batch_fn(batch)
