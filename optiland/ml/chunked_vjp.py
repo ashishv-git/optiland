@@ -348,18 +348,35 @@ class _ChunkedVJP(_AutogradFunction):
         # raise a RuntimeError for unreachable parameters after the loop ends.
         connected = [False] * len(params)
 
-        # enable_grad() is required for correctness here, unlike the no_grad()
-        # in forward. once_differentiable runs this method with gradients
-        # disabled, so without it batch_fn records nothing and autograd.grad
-        # fails with "element 0 of tensors does not require grad and does not
-        # have a grad_fn".
+        # Re-evaluate the batches with gradient recording explicitly enabled.
+        # We do this by wrapping the loop in torch.enable_grad(). PyTorch's
+        # autograd engine runs all custom backward() methods with gradients
+        # disabled by default. If we do not explicitly re-enable them,
+        # batch_fn builds no graph, and autograd.grad fails with a
+        # "element 0 of tensors does not require grad" RuntimeError.
         with torch.enable_grad():
             for batch in ctx.batches:
                 if ctx.setup_fn is not None:
-                    # Called inside enable_grad so that a system re-reading
-                    # params here connects them to the graph batch_fn builds.
-                    # Outside it, the re-injected values would be detached and
-                    # no gradient would reach params.
+                    # setup_fn must run before every batch, inside
+                    # enable_grad(). It re-establishes the computational graph
+                    # edges between params and the system's internal state.
+                    #
+                    # The full forward-pass data flow is:
+                    #   nn.Parameter --(setup_fn)--> optical system's Variable
+                    #       --(ray trace & reduce)--> total --(merit fn)--> loss
+                    #
+                    # For example, OpticalSystemModule._sync_params_to_problem()
+                    # in wrappers.py copies the current values from the
+                    # optimizer's nn.Parameter tensors (e.g., a lens radius)
+                    # into the optical system's Variable objects. This copy may
+                    # involve intermediate operations (such as scaling),
+                    # creating graph nodes between params and the Variable
+                    # objects. After each batch, retain_graph=False frees those
+                    # nodes. Without a fresh setup_fn call, the next batch
+                    # would trace through freed graph nodes, and gradients
+                    # would not reach params. The enable_grad() context is
+                    # required so that these re-established edges are tracked
+                    # by autograd; outside it, they would be detached.
                     ctx.setup_fn()
 
                 contribution = ctx.batch_fn(batch)
