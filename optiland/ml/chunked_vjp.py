@@ -2,10 +2,10 @@
 
 Differentiating a ray trace requires memory proportional to the number of
 rays, because reverse-mode autograd retains the whole graph until the
-backward pass runs. Many optical quantities are *reductions* over rays -- a
-rendered image, an irradiance map -- each accumulating one contribution per
-ray into a single total. Differentiating such a reduction over enough rays
-produces an autograd graph that exceeds device memory.
+backward pass runs. Many optical quantities are *reductions* over rays. A
+rendered image and an irradiance map are both examples, each accumulating one
+contribution per ray into a single total. Differentiating such a reduction
+over enough rays produces an autograd graph that exceeds device memory.
 
 The loss is computed from ``params`` in two steps::
 
@@ -165,11 +165,13 @@ if TYPE_CHECKING:
 # established approach here.
 _AutogradFunction = torch.autograd.Function if torch is not None else object
 
-# Pick the decorator that backward() below will carry. once_differentiable
-# makes a second differentiation raise instead of returning a wrong answer;
-# this module supports first-order gradients only. It needs the same fallback
-# as _AutogradFunction above, because a decorator is applied when the class
-# body runs, which happens as the file is imported.
+# Pick the decorator applied to backward(). This module computes first-order
+# gradients only. Differentiating the gradient that backward() returns is
+# unsupported, and fails with or without the decorator. once_differentiable
+# only makes the error name the cause.
+#
+# A decorator is applied when the class body runs, which happens as the file
+# is imported, so the name has to resolve whether or not torch is installed.
 if torch is not None:
     _once_differentiable = torch.autograd.function.once_differentiable
 else:  # pragma: no cover - only runs when torch is not installed
@@ -387,46 +389,55 @@ class _ChunkedVJP(_AutogradFunction):
                     "grad_output (the gradient of the loss with respect to the total)",
                 )
 
-                # autograd.grad returns the gradients; the engine applies
-                # whatever this method returns. contribution.backward() would
-                # apply them here as well, and every gradient would come out
-                # doubled with no error raised. Returning them is also what
-                # makes an explicit params list necessary: autograd.grad needs
-                # its inputs named, which .backward() would have inferred.
+                # PyTorch's autograd engine applies the gradients that this
+                # method returns. Calling contribution.backward() here would
+                # apply them a second time, and every gradient would silently
+                # come out doubled. autograd.grad returns the gradients
+                # instead of applying them, and requires its inputs to be
+                # named. That is why chunked_vjp takes params as an explicit
+                # argument.
                 vjps = torch.autograd.grad(
                     contribution,
                     params,
                     grad_outputs=grad_output,
-                    # This batch's graph is freed as its gradient is taken, so
-                    # only one exists at a time. It is the line that bounds
-                    # the memory.
+                    # Frees this batch's graph as the gradient is computed, so
+                    # only one graph exists at a time. With retain_graph=True,
+                    # every batch's graph would be retained and peak graph
+                    # memory would grow with the number of batches.
                     retain_graph=False,
-                    # Returns None for a param this batch did not reach,
-                    # instead of raising. Some batches legitimately miss a
-                    # param; a param that every batch misses is the error, and
-                    # connected[] below is what tells the two apart.
+                    # Returns None for a param that this batch's graph does
+                    # not reach. Without this flag set to True, autograd.grad
+                    # raises instead. The graph for one batch may legitimately
+                    # reach only some params. A param that no batch's graph
+                    # reaches is an error.
                     allow_unused=True,
                 )
 
+                # Accumulate this batch's share into the parameter gradients,
+                # and record which params were reached.
                 for i, vjp in enumerate(vjps):
                     if vjp is not None:
                         param_grads[i] += vjp
                         connected[i] = True
 
+        # Checked after the loop, since a param missed by one batch may still
+        # be reached by another.
         unused = [i for i, ok in enumerate(connected) if not ok]
         if unused:
             raise RuntimeError(
                 f"No gradient reached params at position(s) {unused}. They are "
                 "not connected to the graph batch_fn builds, so their gradients "
-                "would silently be zero. Check that batch_fn uses these "
-                "tensors, and that setup_fn puts them back into the system on "
-                "every call instead of reading their values out once."
+                "would silently be zero. Check that batch_fn uses these tensors. "
+                "If you pass a setup_fn, check that it writes them into the "
+                "system without detaching them."
             )
 
-        # ctx is reachable from the grad_fn of the total, which the caller may
-        # still hold, so batch_fn, setup_fn and batches would stay alive with
-        # it. batch_fn is typically a closure over the whole pre-generated ray
-        # set. Dropping the references frees them when this pass ends instead.
+        # Drops the references so the memory held by batch_fn, setup_fn and
+        # batches can be freed when this method returns. Otherwise it is
+        # freed only when the caller drops its last reference to the total,
+        # because ctx is reachable from the total's grad_fn. batch_fn usually
+        # refers to the full array of rays, so holding batch_fn holds that
+        # array too.
         ctx.batch_fn = None
         ctx.setup_fn = None
         ctx.batches = None
@@ -511,14 +522,17 @@ def chunked_vjp(
     if not batches:
         raise ValueError("batches is empty; there is nothing to reduce over.")
 
-    # Tested before params is converted, because converting it is what hides
-    # the mistake. A tensor is itself a sequence, so params=radius rather than
-    # params=[radius] iterates into row views, and every later check is
-    # satisfied: the views require grad, and they are genuinely in the graph
-    # batch_fn builds, so backward's connectivity check passes too. Gradients
-    # accumulate onto those temporaries and are discarded with them, leaving
-    # the caller's own tensor with .grad still None and their optimiser with
-    # nothing to step.
+    # Rejects a single tensor passed as params. Checked before params is
+    # converted to a tuple, because after that conversion a tuple built from
+    # a bare tensor is indistinguishable from a correct sequence.
+    #
+    # A tensor is itself a sequence, so passing one directly as params
+    # iterates into its row views instead of failing. Those views require
+    # grad and appear in the graph batch_fn builds, so every later check
+    # passes, including backward's connectivity check. The gradients then
+    # accumulate onto the row views and are discarded with them. The tensor
+    # the caller passed keeps a .grad of None, so every optimizer.step()
+    # leaves it unchanged and that parameter is never optimized.
     if isinstance(params, torch.Tensor):
         raise ValueError(
             "params must be a sequence of tensors, but a single tensor was "
